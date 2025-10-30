@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>CSV Filter（Shift_JIS/UTF-8 ver.251029）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Sans", "Noto Sans JP", sans-serif; margin: 24px; }
+  h1 { font-size: 1.25rem; margin-bottom: 8px; }
+  .controls { display: grid; grid-template-columns: 1fr auto auto auto auto auto auto; gap: 8px; margin-bottom: 12px; }
+  #searchInput { width: 100%; font-size: 1.05rem; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; }
+  .btn { padding: 8px 12px; border: 1px solid #ddd; border-radius: 8px; background: #fff; cursor: pointer; }
+  .btn-primary { background: #2563eb; color: #fff; }
+  #tableContainer { height: 600px; overflow-y: auto; border: 1px solid #ccc; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th, td { border-bottom: 1px solid #eee; padding: 8px; word-break: break-word; white-space: pre-wrap; }
+  th { background: #fafafa; position: sticky; top: 0; cursor: pointer; z-index: 1; }
+  mark { background: #fff29b; }
+  .drop { border: 2px dashed #bbb; padding: 10px; text-align:center; margin: 10px 0; border-radius: 8px; color:#555; }
+  .drop.dragover { background:#fafafa; border-color:#999; color:#222; }
+  .status-err { color:#b00020; }
+</style>
+</head>
+<body>
+<h1>CSV Filter（Shift_JIS/UTF-8 ver.251029）</h1>
+
+<div class="controls">
+  <input id="searchInput" type="text" placeholder="検索語を入力（例：列名:ＸＸ（列名＋半角コロンで検索対象列を限定） -ＸＸ（半角マイナスで除外） &quotＸＸ △△&quot（スペースを含む場合））">
+  <button id="fileButton" class="btn btn-primary">CSVを選択</button>
+  <label><input id="modeAnd" type="radio" name="mode" checked> AND</label>
+  <label><input id="modeOr"  type="radio" name="mode"> OR</label>
+  <label><input id="caseSensitive" type="checkbox"> 大文字小文字を区別</label>
+  <label><input id="fullWidthSensitive" type="checkbox"> 全角半角を区別</label>
+  <button id="exportBtn" class="btn">抽出結果をCSV出力</button>
+</div>
+
+<input id="fileInput" type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" style="display:none">
+<div id="fileName"></div>
+<div id="dropZone" class="drop">ここにCSV/TSVをドラッグ＆ドロップ（Shift_JIS/UTF-8 自動判定・カンマ/タブ/セミコロン/パイプ自動判定）</div>
+<div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<div id="tableContainer">
+  <table id="resultTable" role="table" aria-label="検索結果">
+    <colgroup id="colgroup"></colgroup>
+    <thead><tr id="theadRow"></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<script>
+/* ========= グローバル ========= */
+let HEADERS=[], rows=[], filtered=[], activeCols=new Set();
+let sortState={}, numericCols=new Set(), normalizedRows=[];
+let caseSensitive=false, fullWidthSensitive=false, highlightOn=true; // ハイライト既定ON
+
+/* 可変行高対応・仮想スクロール */
+const DEFAULT_ROW_HEIGHT = 28;
+let avgRowHeight = DEFAULT_ROW_HEIGHT;
+let visibleRowsTarget = 50;
+const OVERSCAN = 10;
+
+// Cache flags to avoid rebuilding normalized rows on every keystroke
+let lastCaseSensitive = false;
+let lastFullWidthSensitive = false;
+
+/* ========= ユーティリティ ========= */
+function debounce(fn, delay){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), delay); }; }
+function setStatus(msg, isErr=false){
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = isErr ? "status-err" : "";
+}
+
+/* 全角半角／大文字小文字の正規化 */
+function normalize(s){
+  let str = String(s ?? "");
+  if(!fullWidthSensitive){
+    str = str.replace(/[Ａ-Ｚａ-ｚ０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
+    str = str.replace(/　/g, " ");
+  }
+  return caseSensitive ? str : str.toLowerCase();
+}
+
+/* ========= 文字コード＆区切り自動判定付き 読み込み ========= */
+async function readTextSmart(file){
+  // 常に ArrayBuffer から開始（ブラウザの暗黙差異を吸収）
+  const buf = await file.arrayBuffer();
+  const u8  = new Uint8Array(buf);
+  // 1) UTF-8
+  let utf8Text = "";
+  try { utf8Text = new TextDecoder("utf-8", { fatal: false }).decode(u8); }
+  catch (e) { utf8Text = new TextDecoder().decode(u8); }
+  const replCount = (utf8Text.match(/\uFFFD/g) || []).length;
+  // 2) 文字化け疑い時のみ SJIS 系を試す
+  if (replCount > 5 && "TextDecoder" in window) {
+    const encCandidates = ["shift_jis", "windows-31j", "x-sjis", "ms932"];
+    let bestText = utf8Text, bestRepl = replCount;
+    for (const enc of encCandidates) {
+      try {
+        const candidate = new TextDecoder(enc, { fatal: false }).decode(u8);
+        const candidateRepl = (candidate.match(/\uFFFD/g) || []).length;
+        if (candidateRepl < bestRepl) { bestText = candidate; bestRepl = candidateRepl; if (bestRepl === 0) return bestText; }
+      } catch {}
+    }
+    return bestText;
+  }
+  return utf8Text;
+}
+
+/* 区切り文字自動判定 */
+function detectDelimiter(text){
+  const lines = text.split(/\r\n|\n|\r/).slice(0, 10).filter(l=>l.length);
+  const cands = [",","\t",";","|"];
+  let best = ",", bestScore = -1;
+  for(const d of cands){
+    let score = 0;
+    for(const line of lines){ score += (line.split(d).length - 1); }
+    if(score > bestScore){ bestScore=score; best=d; }
+  }
+  return best;
+}
+
+/* RFC4180相当のCSVパーサ（任意区切り対応） */
+function parseCSV(text, delimiter=","){
+  if(text && text.charCodeAt(0)===0xFEFF) text = text.slice(1);
+  const out=[]; let field="", row=[], i=0, inQuotes=false;
+  while(i < text.length){
+    const ch = text[i];
+    if(inQuotes){
+      if(ch === '"'){
+        if(text[i+1] === '"'){ field+='"'; i+=2; continue; }
+        inQuotes=false; i++; continue;
+      } else { field+=ch; i++; continue; }
+    } else {
+      if(ch === '"'){ inQuotes=true; i++; continue; }
+      if(ch === delimiter){ row.push(field); field=""; i++; continue; }
+      if(ch === "\r"){ if(text[i+1]==="\n") i++; row.push(field); out.push(row); row=[]; field=""; i++; continue; }
+      if(ch === "\n"){ row.push(field); out.push(row); row=[]; field=""; i++; continue; }
+      field+=ch; i++;
+    }
+  }
+  row.push(field);
+  if(!(row.length===1 && row[0]==="")) out.push(row);
+
+  let headers = (out[0] || []).map(h=>String(h??"").trim());
+  let body = out.slice(1);
+
+  const headerAllEmpty = headers.length===0 || headers.every(h=>h==="");
+  if(headerAllEmpty && body.length>0){
+    headers = (body[0] || []).map(h=>String(h??"").trim());
+    body = body.slice(1);
+  }
+
+  headers = ensureHeaders(headers);
+
+  const data = body
+    .filter(r => r.some(cell => String(cell||"").length))
+    .map(r => {
+      const obj={};
+      for(let j=0;j<headers.length;j++) obj[headers[j]] = r[j] != null ? r[j] : "";
+      return obj;
+    });
+
+  return { headers, data };
+}
+
+function ensureHeaders(headers){
+  const result=[]; const seen=new Set();
+  for(let i=0;i<headers.length;i++){
+    let h = String(headers[i] ?? "").trim();
+    if(!h) h = `列${i+1}`;
+    let name = h, k=2;
+    while(seen.has(name)){ name = `${h}_${k++}`; }
+    seen.add(name); result.push(name);
+  }
+  if(result.length===0) result.push("列1");
+  return result;
+}
+
+/* ========= 数値列判定 ========= */
+function detectNumericCols(headers, data){
+  const set=new Set(), re=/^[\s]*[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?[\s]*$/i;
+  headers.forEach(h=>{
+    let total=0, num=0;
+    for(let i=0;i<data.length && total<200;i++){
+      const v = String(data[i][h] ?? "").trim();
+      if(!v) continue;
+      total++; if(re.test(v)) num++;
+    }
+    if(total>0 && num/total>=0.8) set.add(h);
+  });
+  return set;
+}
+
+/* ========= クエリ解析 ========= */
+function splitQuery(input){
+  const tokens=[], re=/\"([^\"]+)\"|([^ \u3000]+)/g; let m;
+  while((m=re.exec(input))!==null){ tokens.push(m[1]||m[2]); }
+  return tokens;
+}
+function parseQuery(q){
+  const parts = splitQuery(q);
+  const generalInclude=[], generalExclude=[], perCol={};
+  for(let token of parts){
+    let neg=false; if(token.startsWith("-")){ neg=true; token=token.slice(1); }
+    const idx = token.indexOf(":"); let col=null, term=token;
+    if(idx>0){ col=token.slice(0,idx); term=token.slice(idx+1); if(!HEADERS.includes(col)){ col=null; term=token; } }
+    const norm = normalize(term);
+    if(col){
+      perCol[col]=perCol[col]||{include:[],exclude:[]};
+      (neg?perCol[col].exclude:perCol[col].include).push(norm);
+    } else {
+      (neg?generalExclude:generalInclude).push(term);
+    }
+  }
+  const generalPhrases = generalInclude.filter(t=>t.includes(" "));
+  return { generalInclude, generalExclude, generalPhrases, perCol };
+}
+
+/* ========= 正規化キャッシュ ========= */
+function buildNormalizedRows(){
+  normalizedRows = rows.map(r=>{
+    const obj={}; for(const h of HEADERS) obj[h]=normalize(r[h]);
+    return obj;
+  });
+}
+
+/* ========= マッチング ========= */
+function matchRowCached(idx, generalInclude, generalExclude, generalPhrases, perCol, mode){
+  const rowNorm = normalizedRows[idx];
+  for(const col in perCol){
+    const target=rowNorm[col]; const {include,exclude}=perCol[col];
+    for(const t of include) if(!target.includes(t)) return false;
+    for(const t of exclude) if(target.includes(t)) return false;
+  }
+  const anyCols = [...activeCols].map(c=>rowNorm[c]);
+  const exTerms = generalExclude.map(x=>normalize(x));
+  for(const t of exTerms) for(const v of anyCols) if(v.includes(t)) return false;
+
+  const incTerms = generalInclude.map(x=>normalize(x));
+  if(incTerms.length){
+    if(mode==="AND"){ for(const t of incTerms){ if(!anyCols.some(v=>v.includes(t))) return false; } }
+    else { if(!incTerms.some(t=>anyCols.some(v=>v.includes(t)))) return false; }
+  }
+  for(const phrase of generalPhrases){
+    const p = normalize(phrase);
+    if(!anyCols.some(v=>v.includes(p))) return false;
+  }
+  return true;
+}
+
+/* ========= ソート ========= */
+function sortData(data){
+  const col = Object.keys(sortState).find(c=>sortState[c]);
+  if(!col) return data;
+  const dir = sortState[col]==="asc" ? 1 : -1;
+  if(numericCols.has(col)){
+    return [...data].sort((a,b)=>((parseFloat(a[col])||0)-(parseFloat(b[col])||0))*dir);
+  }
+  return [...data].sort((a,b)=>String(a[col]).localeCompare(String(b[col]),"ja")*dir);
+}
+
+/* ========= ハイライト ========= */
+function highlightSafe(text, terms){
+  const span=document.createElement("span");
+  const val=String(text??""); if(!highlightOn||terms.length===0){ span.textContent=val; return span; }
+  let lastIndex=0; const lower=normalize(val); const frag=document.createDocumentFragment();
+  for(let i=0;i<val.length;i++){
+    for(const t of terms){
+      const tt=normalize(t);
+      if(tt && lower.startsWith(tt,i)){
+        if(i>lastIndex) frag.append(val.slice(lastIndex,i));
+        const mark=document.createElement("mark"); mark.textContent=val.slice(i,i+tt.length);
+        frag.append(mark); i+=tt.length-1; lastIndex=i+1; break;
+      }
+    }
+  }
+  if(lastIndex<val.length) frag.append(val.slice(lastIndex));
+  span.append(frag); return span;
+}
+
+/* ========= 列幅調整（冒頭サンプルによる） ========= */
+function adjustColumnWidths(sampleRows){
+  const colgroup=document.getElementById("colgroup"); if(!colgroup) return;
+  const maxChars=HEADERS.map(()=>0);
+  sampleRows.forEach(r=>{
+    HEADERS.forEach((h,i)=>{ maxChars[i]=Math.max(maxChars[i], String(r[h]||"").length); });
+  });
+  colgroup.innerHTML="";
+  maxChars.forEach(chars=>{
+    const col=document.createElement("col");
+    const width=Math.min(Math.max(chars*8, 80), 400);
+    col.style.width=width+"px";
+    colgroup.appendChild(col);
+  });
+}
+
+/* ========= 表示（可変行高 仮想スクロール） ========= */
+function renderVirtual(startIndex){
+  const tbody=document.getElementById("tbody");
+  tbody.innerHTML="";
+
+  const maxStart = Math.max(0, filtered.length - visibleRowsTarget);
+  const safeStart = Math.min(Math.max(0, startIndex|0), maxStart);
+  const end = Math.min(safeStart + visibleRowsTarget + OVERSCAN, filtered.length);
+  const visibleCount = Math.max(0, end - safeStart);
+
+  const {generalInclude,generalExclude,generalPhrases,perCol} = parseQuery(document.getElementById("searchInput").value||"");
+  const dispPerCol={}; for(const col in perCol) dispPerCol[col]=perCol[col].include||[];
+  const dispGeneral = generalInclude.concat(generalPhrases);
+  const normalizedGeneral = dispGeneral.map(t=>normalize(t)).filter(Boolean);
+
+  //const topPadPx = Math.max(0, Math.floor(safeStart * avgRowHeight));
+  //const topSpacer=document.createElement("tr"); topSpacer.className="spacer";
+  //const topTd=document.createElement("td"); topTd.colSpan=Math.max(1, HEADERS.length); topTd.style.height=topPadPx+"px";
+  //topSpacer.appendChild(topTd); tbody.appendChild(topSpacer);
+
+  //一番目のデータの上に余計な罫線が入っていたので改善。
+  let topPadPx = 0;
+  if (safeStart > 0) {
+    topPadPx = Math.max(0, Math.floor(safeStart * avgRowHeight));
+    const topSpacer = document.createElement("tr");
+    topSpacer.className = "spacer";
+    const topTd = document.createElement("td");
+    topTd.colSpan = Math.max(1, HEADERS.length);
+    topTd.style.height = topPadPx + "px";
+    topSpacer.appendChild(topTd);
+    tbody.appendChild(topSpacer);
+  }
+
+  const frag=document.createDocumentFragment();
+  for(let i=safeStart;i<end;i++){
+    const r=filtered[i]; const tr=document.createElement("tr");
+    for(const col of HEADERS){
+      const td=document.createElement("td");
+      const terms=(dispPerCol[col]||[]).concat(normalizedGeneral);
+      td.append( highlightSafe(r[col], terms) );
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+
+
+  const estChunkHeight = Math.max(0, Math.floor(visibleCount * avgRowHeight));
+  const totalEstHeight = Math.max(0, Math.floor(filtered.length * avgRowHeight));
+  const bottomPadPx = Math.max(0, totalEstHeight - topPadPx - estChunkHeight);
+  const bottomSpacer=document.createElement("tr"); bottomSpacer.className="spacer";
+  const bottomTd=document.createElement("td"); bottomTd.colSpan=Math.max(1, HEADERS.length); bottomTd.style.height=bottomPadPx+"px";
+  bottomSpacer.appendChild(bottomTd); tbody.appendChild(bottomSpacer);
+
+  let sum=0, cnt=0;
+  for(let i=1;i<tbody.rows.length-1;i++){
+    sum += tbody.rows[i].getBoundingClientRect().height; cnt++;
+  }
+  if(cnt>0){
+    const newAvg = sum / cnt;
+    avgRowHeight = (avgRowHeight*0.7) + (newAvg*0.3);
+  }
+}
+
+/* ========= フィルタ（検索＋ソート） ========= */
+function runFilter(){
+  caseSensitive      = document.getElementById("caseSensitive").checked;
+  fullWidthSensitive = document.getElementById("fullWidthSensitive").checked;
+
+  if (lastCaseSensitive !== caseSensitive || lastFullWidthSensitive !== fullWidthSensitive) {
+    buildNormalizedRows();
+    lastCaseSensitive = caseSensitive;
+    lastFullWidthSensitive = fullWidthSensitive;
+  }
+
+  const q    = document.getElementById("searchInput").value || "";
+  const mode = document.getElementById("modeAnd").checked ? "AND" : "OR";
+  const {generalInclude,generalExclude,generalPhrases,perCol} = parseQuery(q);
+
+  const matched=[];
+  for(let i=0;i<rows.length;i++){
+    if(matchRowCached(i,generalInclude,generalExclude,generalPhrases,perCol,mode)) matched.push(rows[i]);
+  }
+  filtered = sortData(matched);
+
+  setStatus(`表示件数：${filtered.length} / 総件数：${rows.length}`);
+  avgRowHeight = DEFAULT_ROW_HEIGHT;
+  document.getElementById("tableContainer").scrollTop = 0;
+  renderVirtual(0);
+  // refresh sort indicators for accessibility and UX
+  updateHeaderIndicators();
+}
+
+/* ========= ヘッダー ========= */
+function buildHeader(){
+  const thead=document.getElementById("theadRow"); thead.innerHTML="";
+  HEADERS.forEach(h=>{
+    const th=document.createElement("th"); th.scope="col"; th.textContent=h;
+    const s=document.createElement("span"); s.textContent = sortState[h]==="asc" ? " ▲" : sortState[h]==="desc" ? " ▼" : "";
+    th.appendChild(s);
+    th.addEventListener("click",()=>{
+      const curr = sortState[h];
+      sortState = {};
+      if (curr === "asc") {
+        sortState[h] = "desc";
+      } else if (curr === "desc") {
+        // off: leave sortState empty
+      } else {
+        sortState[h] = "asc";
+      }
+      runFilter();
+      updateHeaderIndicators();
+    });
+    thead.appendChild(th);
+  });
+}
+
+/* ========= CSV出力（BOM付きUTF-8） ========= */
+function exportCSV(data){
+  if(!data || !data.length){ alert("出力対象がありません"); return; }
+  const headers = HEADERS;
+  const escape = s => `"${String(s ?? "").replace(/"/g,'""')}"`;
+  const sanitizeHeader = s => String(s ?? "").replace(/\r\n|\r|\n/g, "");
+  const lines = [headers.map(h => `"${sanitizeHeader(String(h ?? "").replace(/"/g,'""'))}"`).join(",")];
+  data.forEach(r => lines.push(headers.map(h => escape(r[h])).join(",")));
+
+  const bom = "\uFEFF"; // UTF-8 BOM
+  const blob = new Blob([bom + lines.join("\r\n")], { type:"text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "filtered.csv";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/* ========= 初期化（読み込み） ========= */
+async function handleFile(file){
+  try{
+    setStatus("読み込み中…");
+    const raw = await readTextSmart(file);
+    const delimiter = detectDelimiter(raw);
+    let {headers, data} = parseCSV(raw, delimiter);
+
+    if(!headers || headers.length===0){
+      headers = ensureHeaders([]);
+    }
+
+    HEADERS = headers;
+    rows = data;
+    activeCols = new Set(HEADERS);
+    numericCols = detectNumericCols(HEADERS, rows);
+    sortState = {};
+
+    buildNormalizedRows();
+    buildHeader();
+    updateHeaderIndicators();
+
+    const container = document.getElementById("tableContainer");
+    visibleRowsTarget = Math.max(20, Math.ceil(container.clientHeight / DEFAULT_ROW_HEIGHT));
+
+    adjustColumnWidths(rows.slice(0, 50));
+
+    filtered = rows.slice();
+    document.getElementById("fileName").textContent = `読み込み完了：${rows.length}件（${file.name}）`;
+    setStatus(`表示件数：${filtered.length} / 総件数：${rows.length}`);
+    avgRowHeight = DEFAULT_ROW_HEIGHT;
+    document.getElementById("tableContainer").scrollTop = 0;
+    renderVirtual(0);
+  }catch(err){
+    console.error("読み込み失敗:", err);
+    setStatus("読み込みに失敗しました：" + err.message, true);
+    alert("CSV読み込みに失敗しました。\n" + err.message);
+  }
+}
+
+/* ========= イベント配線 ========= */
+const fileInput  = document.getElementById("fileInput");
+const fileButton = document.getElementById("fileButton");
+
+// ファイル選択ボタン：showPicker() → click() フォールバック
+fileButton.addEventListener("click", () => {
+  try {
+    if (typeof fileInput.showPicker === "function") { fileInput.showPicker(); } // 主要ブラウザ対応
+    else { fileInput.click(); }
+  } catch { fileInput.click(); }
+});
+
+document.getElementById("fileInput").addEventListener("change", async (e)=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  await handleFile(f);
+});
+
+// D&D：ゾーン内の dragover で drop を許可
+const dz = document.getElementById("dropZone");
+["dragenter","dragover"].forEach(ev => dz.addEventListener(ev, e=>{ e.preventDefault(); dz.classList.add("dragover"); }));
+["dragleave","drop"].forEach(ev => dz.addEventListener(ev, e=>{ e.preventDefault(); dz.classList.remove("dragover"); }));
+dz.addEventListener("drop", async (e)=>{
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if(!file) return;
+  await handleFile(file);
+});
+
+// ページ外への誤ドロップでのナビゲーション阻止（安全策）
+window.addEventListener("dragover", (e) => {
+  const t = e.target;
+  if (t && t.tagName === "INPUT" && t.type === "file") return;
+  e.preventDefault();
+}, false);
+window.addEventListener("drop", (e) => {
+  const t = e.target;
+  if (t && t.tagName === "INPUT" && t.type === "file") return;
+  e.preventDefault();
+}, false);
+
+document.getElementById("searchInput").addEventListener("input", debounce(runFilter, 250));
+document.getElementById("modeAnd").addEventListener("change", runFilter);
+document.getElementById("modeOr" ).addEventListener("change", runFilter);
+document.getElementById("caseSensitive").addEventListener("change", runFilter);
+document.getElementById("fullWidthSensitive").addEventListener("change", runFilter);
+
+let scrollPending=false;
+document.getElementById("tableContainer").addEventListener("scroll", ()=>{
+  if(scrollPending) return;
+  scrollPending = true;
+  requestAnimationFrame(()=>{
+    const top = document.getElementById("tableContainer").scrollTop;
+    const start = Math.floor(top / Math.max(16, avgRowHeight));
+    renderVirtual(start);
+    scrollPending = false;
+  });
+});
+
+// CSV出力ボタン
+document.getElementById("exportBtn").addEventListener("click", () => exportCSV(filtered));
+
+// keep header indicators (arrow + aria-sort) in sync
+function updateHeaderIndicators(){
+  const thead=document.getElementById("theadRow");
+  if(!thead) return;
+  const ths = Array.from(thead.children);
+  HEADERS.forEach((h, idx)=>{
+    const th = ths[idx]; if(!th) return;
+    const s = th.querySelector("span") || document.createElement("span");
+    const dir = sortState[h];
+    if(dir === "asc"){ s.textContent = " \u25B2"; th.setAttribute("aria-sort","ascending"); }
+    else if(dir === "desc"){ s.textContent = " \u25BC"; th.setAttribute("aria-sort","descending"); }
+    else { s.textContent = ""; th.setAttribute("aria-sort","none"); }
+    if(!s.isConnected) th.appendChild(s);
+  });
+}
+
+if(window.innerWidth > 600) document.getElementById("searchInput").focus();
+
+// 末尾到達確認用（必要なら残してOK）
+console.log("init-ok");
+</script>
+</body>
+</html>
