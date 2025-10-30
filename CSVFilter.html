@@ -310,6 +310,12 @@ function renderVirtual(startIndex){
   const dispGeneral = generalInclude.concat(generalPhrases);
   const normalizedGeneral = dispGeneral.map(t=>normalize(t)).filter(Boolean);
 
+  //const topPadPx = Math.max(0, Math.floor(safeStart * avgRowHeight));
+  //const topSpacer=document.createElement("tr"); topSpacer.className="spacer";
+  //const topTd=document.createElement("td"); topTd.colSpan=Math.max(1, HEADERS.length); topTd.style.height=topPadPx+"px";
+  //topSpacer.appendChild(topTd); tbody.appendChild(topSpacer);
+
+  //一番目のデータの上に余計な罫線が入っていたので改善。
   let topPadPx = 0;
   if (safeStart > 0) {
     topPadPx = Math.max(0, Math.floor(safeStart * avgRowHeight));
@@ -433,6 +439,8 @@ function exportCSV(data){
 async function handleFile(file){
   try{
     setStatus("読み込み中…");
+    const searchInput = document.getElementById("searchInput");
+    searchInput.value = "";
     const raw = await readTextSmart(file);
     const delimiter = detectDelimiter(raw);
     let {headers, data} = parseCSV(raw, delimiter);
@@ -553,4 +561,3 @@ console.log("init-ok");
 </script>
 </body>
 </html>
-
