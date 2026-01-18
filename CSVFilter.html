@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>CSV Filter（Shift_JIS/UTF-8 ver.251029）</title>
+<title>CSV Filter（Shift_JIS/UTF-8 ver.251215）</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Sans", "Noto Sans JP", sans-serif; margin: 24px; }
@@ -22,7 +22,7 @@
 </style>
 </head>
 <body>
-<h1>CSV Filter（Shift_JIS/UTF-8 ver.251029）</h1>
+<h1>CSV Filter（Shift_JIS/UTF-8 ver.251215）</h1>
 
 <div class="controls">
   <input id="searchInput" type="text" placeholder="検索語を入力（例：列名:ＸＸ（列名＋半角コロンで検索対象列を限定） -ＸＸ（半角マイナスで除外） &quotＸＸ △△&quot（スペースを含む場合））">
@@ -50,7 +50,11 @@
 <script>
 /* ========= グローバル ========= */
 let HEADERS=[], rows=[], filtered=[], activeCols=new Set();
-let sortState={}, numericCols=new Set(), normalizedRows=[];
+let sortState={}, numericCols=new Set();
+// 正規化は「遅延キャッシュ」で必要分のみ作る（大容量CSVでのメモリ増加を抑制）
+let normCellCache=[];
+let normAnyCache=[];
+
 let caseSensitive=false, fullWidthSensitive=false, highlightOn=true; // ハイライト既定ON
 
 /* 可変行高対応・仮想スクロール */
@@ -83,33 +87,56 @@ function normalize(s){
 
 /* ========= 文字コード＆区切り自動判定付き 読み込み ========= */
 async function readTextSmart(file){
-  // 常に ArrayBuffer から開始（ブラウザの暗黙差異を吸収）
-  const buf = await file.arrayBuffer();
-  const u8  = new Uint8Array(buf);
-  // 1) UTF-8
-  let utf8Text = "";
-  try { utf8Text = new TextDecoder("utf-8", { fatal: false }).decode(u8); }
-  catch (e) { utf8Text = new TextDecoder().decode(u8); }
-  const replCount = (utf8Text.match(/\uFFFD/g) || []).length;
-  // 2) 文字化け疑い時のみ SJIS 系を試す
-  if (replCount > 5 && "TextDecoder" in window) {
-    const encCandidates = ["shift_jis", "windows-31j", "x-sjis", "ms932"];
-    let bestText = utf8Text, bestRepl = replCount;
-    for (const enc of encCandidates) {
-      try {
-        const candidate = new TextDecoder(enc, { fatal: false }).decode(u8);
-        const candidateRepl = (candidate.match(/\uFFFD/g) || []).length;
-        if (candidateRepl < bestRepl) { bestText = candidate; bestRepl = candidateRepl; if (bestRepl === 0) return bestText; }
-      } catch {}
-    }
-    return bestText;
+  // 先頭サンプルで文字コード推定 → 全文は1回だけデコード（メモリピーク低減）
+  const SAMPLE_BYTES = 64 * 1024;
+  const sampleBuf = await file.slice(0, SAMPLE_BYTES).arrayBuffer();
+  const sampleU8  = new Uint8Array(sampleBuf);
+
+  function countFFFD(str, maxScan = 200000){
+    let n=0;
+    const lim = Math.min(str.length, maxScan);
+    for(let i=0;i<lim;i++) if(str.charCodeAt(i)===0xFFFD) n++;
+    return n;
   }
-  return utf8Text;
+  function tryDecode(u8, enc){
+    const dec = new TextDecoder(enc, { fatal:false });
+    const s = dec.decode(u8);
+    return { text:s, repl: countFFFD(s) };
+  }
+
+  // BOM があれば UTF-8 を優先
+  const hasUtf8Bom = sampleU8.length>=3 && sampleU8[0]===0xEF && sampleU8[1]===0xBB && sampleU8[2]===0xBF;
+  let bestEnc = "utf-8";
+  let best;
+  try { best = tryDecode(sampleU8, "utf-8"); }
+  catch { best = { text: new TextDecoder().decode(sampleU8), repl: 999999 }; }
+
+  if(!hasUtf8Bom && best.repl > 5 && ("TextDecoder" in window)){
+    const encCandidates = ["shift_jis","windows-31j","ms932","x-sjis"]; // 実装差を吸収
+    for(const enc of encCandidates){
+      try{
+        const cand = tryDecode(sampleU8, enc);
+        if(cand.repl < best.repl){ best = cand; bestEnc = enc; if(best.repl===0) break; }
+      }catch{}
+    }
+  }
+
+  const fullBuf = await file.arrayBuffer();
+  const fullU8  = new Uint8Array(fullBuf);
+  let text;
+  try { text = new TextDecoder(bestEnc, { fatal:false }).decode(fullU8); }
+  catch { text = new TextDecoder().decode(fullU8); }
+
+  if(text && text.charCodeAt(0)===0xFEFF) text = text.slice(1); // BOM除去
+  return text;
 }
+
 
 /* 区切り文字自動判定 */
 function detectDelimiter(text){
-  const lines = text.split(/\r\n|\n|\r/).slice(0, 10).filter(l=>l.length);
+  // 先頭だけで判定（全文splitを避けてメモリピーク低減）
+  const head = text.slice(0, 20000);
+  const lines = head.split(/\r\n|\n|\r/).slice(0, 10).filter(l=>l.length);
   const cands = [",","\t",";","|"];
   let best = ",", bestScore = -1;
   for(const d of cands){
@@ -119,6 +146,7 @@ function detectDelimiter(text){
   }
   return best;
 }
+
 
 /* RFC4180相当のCSVパーサ（任意区切り対応） */
 function parseCSV(text, delimiter=","){
@@ -218,36 +246,54 @@ function parseQuery(q){
 }
 
 /* ========= 正規化キャッシュ ========= */
-function buildNormalizedRows(){
-  normalizedRows = rows.map(r=>{
-    const obj={}; for(const h of HEADERS) obj[h]=normalize(r[h]);
-    return obj;
-  });
+function resetNormCaches(){
+  normCellCache = new Array(rows.length);
+  normAnyCache  = new Array(rows.length);
 }
+function normCell(rowIndex, col){
+  let rowCache = normCellCache[rowIndex];
+  if(!rowCache){ rowCache = {}; normCellCache[rowIndex] = rowCache; }
+  if(rowCache[col] === undefined) rowCache[col] = normalize(rows[rowIndex][col]);
+  return rowCache[col];
+}
+function normAny(rowIndex){
+  if(normAnyCache[rowIndex] !== undefined) return normAnyCache[rowIndex];
+  let s = "";
+  for(const c of activeCols){ s += "\u0001" + normCell(rowIndex, c); }
+  normAnyCache[rowIndex] = s;
+  return s;
+}
+
 
 /* ========= マッチング ========= */
 function matchRowCached(idx, generalInclude, generalExclude, generalPhrases, perCol, mode){
-  const rowNorm = normalizedRows[idx];
+  // 列指定条件（列ごとに遅延正規化）
   for(const col in perCol){
-    const target=rowNorm[col]; const {include,exclude}=perCol[col];
+    const target = normCell(idx, col);
+    const {include,exclude} = perCol[col];
     for(const t of include) if(!target.includes(t)) return false;
     for(const t of exclude) if(target.includes(t)) return false;
   }
-  const anyCols = [...activeCols].map(c=>rowNorm[c]);
+
+  // 全列対象条件は、activeCols を連結した正規化文字列に対して判定（配列生成を避ける）
+  const any = normAny(idx);
+
   const exTerms = generalExclude.map(x=>normalize(x));
-  for(const t of exTerms) for(const v of anyCols) if(v.includes(t)) return false;
+  for(const t of exTerms){ if(t && any.includes(t)) return false; }
 
   const incTerms = generalInclude.map(x=>normalize(x));
   if(incTerms.length){
-    if(mode==="AND"){ for(const t of incTerms){ if(!anyCols.some(v=>v.includes(t))) return false; } }
-    else { if(!incTerms.some(t=>anyCols.some(v=>v.includes(t)))) return false; }
+    if(mode==="AND"){ for(const t of incTerms){ if(t && !any.includes(t)) return false; } }
+    else { if(!incTerms.some(t=>t && any.includes(t))) return false; }
   }
+
   for(const phrase of generalPhrases){
     const p = normalize(phrase);
-    if(!anyCols.some(v=>v.includes(p))) return false;
+    if(p && !any.includes(p)) return false;
   }
   return true;
 }
+
 
 /* ========= ソート ========= */
 function sortData(data){
@@ -365,7 +411,7 @@ function runFilter(){
   fullWidthSensitive = document.getElementById("fullWidthSensitive").checked;
 
   if (lastCaseSensitive !== caseSensitive || lastFullWidthSensitive !== fullWidthSensitive) {
-    buildNormalizedRows();
+    resetNormCaches();
     lastCaseSensitive = caseSensitive;
     lastFullWidthSensitive = fullWidthSensitive;
   }
@@ -455,7 +501,7 @@ async function handleFile(file){
     numericCols = detectNumericCols(HEADERS, rows);
     sortState = {};
 
-    buildNormalizedRows();
+    resetNormCaches();
     buildHeader();
     updateHeaderIndicators();
 
